@@ -1,0 +1,40 @@
+# Binaries for programs and plugins, compiled objects
+*.o
+*.a
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+*.test
+*.prof
+*.mprof
+*.log
+*.svg
+
+# Common folders
+build
+bin
+pkg
+_obj
+_test
+vendor
+
+# Architecture specific extensions/prefixes
+*.[568vq]
+[568vq].out
+
+# Just in case
+*.cgo1.go
+*.cgo2.c
+_cgo_defun.c
+_cgo_gotypes.go
+_cgo_export.*
+
+# development 
+.undodir
+.vscode
+.idea
+.set-project-env
+.session.vim
+_testmain.go

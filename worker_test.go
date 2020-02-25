@@ -1,6 +1,7 @@
 package que
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -8,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/pgtype"
+	"github.com/jackc/pgtype"
 )
 
 func init() {
@@ -121,11 +122,11 @@ func TestWorkerWorkReturnsError(t *testing.T) {
 		t.Errorf("want called=1 was: %d", called)
 	}
 
-	tx, err := c.pool.Begin()
+	tx, err := c.pool.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(context.Background())
 
 	j, err := findOneJob(tx)
 	if err != nil {
@@ -151,7 +152,6 @@ func TestWorkerWorkRescuesPanic(t *testing.T) {
 		"MyJob": func(j *Job) error {
 			called++
 			panic("the panic msg")
-			return nil
 		},
 	}
 	w := NewWorker(c, wm)
@@ -165,11 +165,11 @@ func TestWorkerWorkRescuesPanic(t *testing.T) {
 		t.Errorf("want called=1 was: %d", called)
 	}
 
-	tx, err := c.pool.Begin()
+	tx, err := c.pool.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(context.Background())
 
 	j, err := findOneJob(tx)
 	if err != nil {
@@ -197,8 +197,7 @@ func TestWorkerWorkOneTypeNotInMap(t *testing.T) {
 	c := openTestClient(t)
 	defer truncateAndClose(c.pool)
 
-	currentConns := c.pool.Stat().CurrentConnections
-	availConns := c.pool.Stat().AvailableConnections
+	currentConns, availConns := c.pool.Stat().AcquiredConns(), c.pool.Stat().TotalConns()
 
 	success := false
 	wm := WorkMap{}
@@ -221,18 +220,18 @@ func TestWorkerWorkOneTypeNotInMap(t *testing.T) {
 		t.Errorf("want success=false")
 	}
 
-	if currentConns != c.pool.Stat().CurrentConnections {
-		t.Errorf("want currentConns euqual: before=%d  after=%d", currentConns, c.pool.Stat().CurrentConnections)
+	if currentConns != c.pool.Stat().AcquiredConns() {
+		t.Errorf("want currentConns euqual: before=%d  after=%d", currentConns, c.pool.Stat().AcquiredConns())
 	}
-	if availConns != c.pool.Stat().AvailableConnections {
-		t.Errorf("want availConns euqual: before=%d  after=%d", availConns, c.pool.Stat().AvailableConnections)
+	if availConns != c.pool.Stat().TotalConns() {
+		t.Errorf("want availConns euqual: before=%d  after=%d", availConns, c.pool.Stat().TotalConns())
 	}
 
-	tx, err := c.pool.Begin()
+	tx, err := c.pool.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(context.Background())
 
 	j, err := findOneJob(tx)
 	if err != nil {

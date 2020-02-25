@@ -1,13 +1,13 @@
 package que
 
 import (
-	"fmt"
+	"context"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx"
-	"github.com/jackc/pgx/pgtype"
+	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v4"
 )
 
 func TestLockJob(t *testing.T) {
@@ -60,7 +60,7 @@ func TestLockJob(t *testing.T) {
 	// check for advisory lock
 	var count int64
 	query := "SELECT count(*) FROM pg_locks WHERE locktype=$1 AND objid=$2::bigint"
-	if err = j.pool.QueryRow(query, "advisory", j.ID).Scan(&count); err != nil {
+	if err = j.pool.QueryRow(j.context(), query, "advisory", j.ID).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
@@ -69,7 +69,7 @@ func TestLockJob(t *testing.T) {
 
 	// make sure conn was checked out of pool
 	stat := c.pool.Stat()
-	total, available := stat.CurrentConnections, stat.AvailableConnections
+	total, available := stat.TotalConns(), stat.IdleConns()
 	if want := total - 1; available != want {
 		t.Errorf("want available=%d, got %d", want, available)
 	}
@@ -214,11 +214,11 @@ func TestLockJobAdvisoryRace(t *testing.T) {
 	// *pgx.ConnPool doesn't support pools of only one connection.  Make sure
 	// the other one is busy so we know which backend will be used by LockJob
 	// below.
-	unusedConn, err := c.pool.Acquire()
+	unusedConn, err := c.pool.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.pool.Release(unusedConn)
+	defer unusedConn.Release()
 
 	// We use two jobs: the first one is concurrently deleted, and the second
 	// one is returned by LockJob after recovering from the race condition.
@@ -230,19 +230,19 @@ func TestLockJobAdvisoryRace(t *testing.T) {
 
 	// helper functions
 	newConn := func() *pgx.Conn {
-		conn, err := pgx.Connect(testConnConfig)
+		conn, err := pgx.ConnectConfig(context.Background(), testConnConfig)
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
 		return conn
 	}
-	getBackendPID := func(conn *pgx.Conn) int32 {
+	getBackendPID := func(conn queryable) int32 {
 		var backendPID int32
-		err := conn.QueryRow(`
+		err := conn.QueryRow(context.Background(), `
 			SELECT pg_backend_pid()
 		`).Scan(&backendPID)
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
 		return backendPID
 	}
@@ -251,9 +251,9 @@ func TestLockJobAdvisoryRace(t *testing.T) {
 		i := 0
 		for {
 			var waiting bool
-			err := conn.QueryRow(`SELECT wait_event is not null from pg_stat_activity where pid=$1`, backendPID).Scan(&waiting)
+			err := conn.QueryRow(context.Background(), `SELECT wait_event is not null from pg_stat_activity where pid=$1`, backendPID).Scan(&waiting)
 			if err != nil {
-				panic(err)
+				t.Fatal(err)
 			}
 
 			if waiting {
@@ -261,7 +261,7 @@ func TestLockJobAdvisoryRace(t *testing.T) {
 			} else {
 				i++
 				if i >= 10000/50 {
-					panic(fmt.Sprintf("timed out while waiting for %s", name))
+					t.Fatalf("timed out while waiting for %s", name)
 				}
 
 				time.Sleep(50 * time.Millisecond)
@@ -288,15 +288,15 @@ func TestLockJobAdvisoryRace(t *testing.T) {
 
 	go func() {
 		conn := newConn()
-		defer conn.Close()
+		defer conn.Close(context.Background())
 
-		tx, err := conn.Begin()
+		tx, err := conn.Begin(context.Background())
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
-		_, err = tx.Exec(`LOCK TABLE que_jobs IN ACCESS EXCLUSIVE MODE`)
+		_, err = tx.Exec(context.Background(), `LOCK TABLE que_jobs IN ACCESS EXCLUSIVE MODE`)
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
 
 		// first wait for LockJob to appear behind us
@@ -307,31 +307,31 @@ func TestLockJobAdvisoryRace(t *testing.T) {
 		backendID = <-secondAccessExclusiveBackendIDChan
 		waitUntilBackendIsWaiting(backendID, "second access exclusive lock")
 
-		err = tx.Rollback()
+		err = tx.Rollback(context.Background())
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
 	}()
 
 	go func() {
 		conn := newConn()
-		defer conn.Close()
+		defer conn.Close(context.Background())
 
 		// synchronization point
 		secondAccessExclusiveBackendIDChan <- getBackendPID(conn)
 
-		tx, err := conn.Begin()
+		tx, err := conn.Begin(context.Background())
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
-		_, err = tx.Exec(`LOCK TABLE que_jobs IN ACCESS EXCLUSIVE MODE`)
+		_, err = tx.Exec(context.Background(), `LOCK TABLE que_jobs IN ACCESS EXCLUSIVE MODE`)
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
 
 		// Fake a concurrent transaction grabbing the job
 		var jid int64
-		err = tx.QueryRow(`
+		err = tx.QueryRow(context.Background(), `
 			DELETE FROM que_jobs
 			WHERE job_id =
 				(SELECT min(job_id)
@@ -339,30 +339,30 @@ func TestLockJobAdvisoryRace(t *testing.T) {
 			RETURNING job_id
 		`).Scan(&jid)
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
 
 		deletedJobIDChan <- jid
 
-		err = tx.Commit()
+		err = tx.Commit(context.Background())
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
 		}
 	}()
 
-	conn, err := c.pool.Acquire()
+	conn, err := c.pool.Acquire(context.Background())
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	ourBackendID := getBackendPID(conn)
-	c.pool.Release(conn)
+	conn.Release()
 
 	// synchronization point
 	lockJobBackendIDChan <- ourBackendID
 
 	job, err := c.LockJob("")
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	defer job.Done()
 
@@ -436,7 +436,7 @@ func TestJobDone(t *testing.T) {
 	// make sure lock was released
 	var count int64
 	query := "SELECT count(*) FROM pg_locks WHERE locktype=$1 AND objid=$2::bigint"
-	if err = c.pool.QueryRow(query, "advisory", j.ID).Scan(&count); err != nil {
+	if err = c.pool.QueryRow(j.context(), query, "advisory", j.ID).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
@@ -445,7 +445,7 @@ func TestJobDone(t *testing.T) {
 
 	// make sure conn was returned to pool
 	stat := c.pool.Stat()
-	total, available := stat.CurrentConnections, stat.AvailableConnections
+	total, available := stat.TotalConns(), stat.IdleConns()
 	if total != available {
 		t.Errorf("want available=total, got available=%d total=%d", available, total)
 	}
@@ -495,7 +495,7 @@ func TestJobDeleteFromTx(t *testing.T) {
 	}
 
 	// start a transaction
-	tx, err := conn.Begin()
+	tx, err := conn.Begin(j.context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +505,7 @@ func TestJobDeleteFromTx(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = tx.Commit(); err != nil {
+	if err = tx.Commit(j.context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -546,7 +546,7 @@ func TestJobDeleteFromTxRollback(t *testing.T) {
 	}
 
 	// start a transaction
-	tx, err := conn.Begin()
+	tx, err := conn.Begin(j1.context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,7 +556,7 @@ func TestJobDeleteFromTxRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = tx.Rollback(); err != nil {
+	if err = tx.Rollback(j1.context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -617,7 +617,7 @@ func TestJobError(t *testing.T) {
 	// make sure lock was released
 	var count int64
 	query := "SELECT count(*) FROM pg_locks WHERE locktype=$1 AND objid=$2::bigint"
-	if err = c.pool.QueryRow(query, "advisory", j.ID).Scan(&count); err != nil {
+	if err = c.pool.QueryRow(j.context(), query, "advisory", j.ID).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
@@ -626,7 +626,7 @@ func TestJobError(t *testing.T) {
 
 	// make sure conn was returned to pool
 	stat := c.pool.Stat()
-	total, available := stat.CurrentConnections, stat.AvailableConnections
+	total, available := stat.TotalConns(), stat.IdleConns()
 	if total != available {
 		t.Errorf("want available=total, got available=%d total=%d", available, total)
 	}

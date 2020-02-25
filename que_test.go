@@ -1,26 +1,29 @@
 package que
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
-	"github.com/jackc/pgx"
+	"github.com/jackc/pgx/v4"
+	// "github.com/jackc/pgx/v4/log/testingadapter"
+	"github.com/jackc/pgx/v4/pgxpool"
 )
 
-var testConnConfig = pgx.ConnConfig{
-	Host:     "localhost",
-	Database: "que-go-test",
-}
+var testConnConfig *pgx.ConnConfig
 
 func openTestClientMaxConns(t testing.TB, maxConnections int) *Client {
-	connPoolConfig := pgx.ConnPoolConfig{
-		ConnConfig:     testConnConfig,
-		MaxConnections: maxConnections,
-		AfterConnect:   PrepareStatements,
-	}
-	pool, err := pgx.NewConnPool(connPoolConfig)
+	dsn := fmt.Sprintf("user=app_crossdevice password=app_crossdevice host=localhost dbname=crossdevice pool_max_conns=%d", maxConnections)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	cfg.ConnConfig.RuntimeParams["search_path"] = "crossdevice"
+	// cfg.ConnConfig.Logger = testingadapter.NewLogger(t)
+	// cfg.ConnConfig.LogLevel = pgx.LogLevelDebug
+	cfg.AfterConnect = PrepareStatements
+	pool, err := pgxpool.ConnectConfig(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	testConnConfig = cfg.ConnConfig
 	return NewClient(pool)
 }
 
@@ -28,8 +31,8 @@ func openTestClient(t testing.TB) *Client {
 	return openTestClientMaxConns(t, 5)
 }
 
-func truncateAndClose(pool *pgx.ConnPool) {
-	if _, err := pool.Exec("TRUNCATE TABLE que_jobs"); err != nil {
+func truncateAndClose(pool *pgxpool.Pool) {
+	if _, err := pool.Exec(context.Background(), "TRUNCATE TABLE que_jobs"); err != nil {
 		panic(err)
 	}
 	pool.Close()
@@ -41,7 +44,7 @@ func findOneJob(q queryable) (*Job, error) {
 	FROM que_jobs LIMIT 1`
 
 	j := &Job{}
-	err := q.QueryRow(findSQL).Scan(
+	err := q.QueryRow(context.Background(), findSQL).Scan(
 		&j.Priority,
 		&j.RunAt,
 		&j.ID,

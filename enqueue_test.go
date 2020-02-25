@@ -1,10 +1,11 @@
 package que
 
 import (
+	"context"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/pgtype"
+	"github.com/jackc/pgtype"
 )
 
 func TestEnqueueOnlyType(t *testing.T) {
@@ -138,11 +139,13 @@ func TestEnqueueInTx(t *testing.T) {
 	c := openTestClient(t)
 	defer truncateAndClose(c.pool)
 
-	tx, err := c.pool.Begin()
+	var ctx = context.Background()
+
+	tx, err := c.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
 	if err = c.EnqueueInTx(&Job{Type: "MyJob"}, tx); err != nil {
 		t.Fatal(err)
@@ -156,7 +159,7 @@ func TestEnqueueInTx(t *testing.T) {
 		t.Fatal("want job, got none")
 	}
 
-	if err = tx.Rollback(); err != nil {
+	if err = tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
 

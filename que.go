@@ -1,12 +1,15 @@
 package que
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx"
-	"github.com/jackc/pgx/pgtype"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v4/pgxpool"
 )
 
 // Job is a single unit of work for Que to perform.
@@ -44,8 +47,20 @@ type Job struct {
 
 	mu      sync.Mutex
 	deleted bool
-	pool    *pgx.ConnPool
-	conn    *pgx.Conn
+	pool    *pgxpool.Pool
+	conn    *pgxpool.Conn
+	ctx     context.Context
+}
+
+// context returns context suitable for pgx operations. It will never return nil.
+// NOTE: if callers decides to use cancelable (or deadlined) context for db operations we may need
+// to provide methods to get/set this job's field under mutex protection as it is up to caller to
+// decide what to do with it. It is not yet clear if we need this at all, so this is just a provision for now.
+func (j *Job) context() context.Context {
+	if j.ctx != nil {
+		return j.ctx
+	}
+	return context.Background()
 }
 
 // Conn returns the pgx connection that this job is locked to. You may initiate
@@ -53,14 +68,14 @@ type Job struct {
 // Done(). At that point, this conn will be returned to the pool and it is
 // unsafe to keep using it. This function will return nil if the Job's
 // connection has already been released with Done().
-func (j *Job) Conn() *pgx.Conn {
+func (j *Job) Conn() *pgxpool.Conn {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
 	return j.conn
 }
 
-// Delete marks this job as complete by deleting it form the database.
+// Delete marks this job as complete by deleting it from the database.
 //
 // You must also later call Done() to return this job's database connection to
 // the pool.
@@ -72,7 +87,7 @@ func (j *Job) Delete() error {
 		return nil
 	}
 
-	_, err := j.conn.Exec("que_destroy_job", j.Queue, j.Priority, j.RunAt, j.ID)
+	_, err := j.conn.Exec(j.context(), "que_destroy_job", j.Queue, j.Priority, j.RunAt, j.ID)
 	if err != nil {
 		return err
 	}
@@ -95,9 +110,9 @@ func (j *Job) Done() {
 	var ok bool
 	// Swallow this error because we don't want an unlock failure to cause work to
 	// stop.
-	_ = j.conn.QueryRow("que_unlock_job", j.ID).Scan(&ok)
+	_ = j.conn.QueryRow(j.context(), "que_unlock_job", j.ID).Scan(&ok)
 
-	j.pool.Release(j.conn)
+	j.conn.Release()
 	j.pool = nil
 	j.conn = nil
 }
@@ -112,7 +127,7 @@ func (j *Job) Error(msg string) error {
 	errorCount := j.ErrorCount + 1
 	delay := intPow(int(errorCount), 4) + 3 // TODO: configurable delay
 
-	_, err := j.conn.Exec("que_set_error", errorCount, delay, msg, j.Queue, j.Priority, j.RunAt, j.ID)
+	_, err := j.conn.Exec(j.context(), "que_set_error", errorCount, delay, msg, j.Queue, j.Priority, j.RunAt, j.ID)
 	if err != nil {
 		return err
 	}
@@ -122,13 +137,13 @@ func (j *Job) Error(msg string) error {
 // Client is a Que client that can add jobs to the queue and remove jobs from
 // the queue.
 type Client struct {
-	pool *pgx.ConnPool
+	pool *pgxpool.Pool
 
 	// TODO: add a way to specify default queueing options
 }
 
 // NewClient creates a new Client that uses the pgx pool.
-func NewClient(pool *pgx.ConnPool) *Client {
+func NewClient(pool *pgxpool.Pool) *Client {
 	return &Client{pool: pool}
 }
 
@@ -147,7 +162,7 @@ func (c *Client) Enqueue(j *Job) error {
 //
 // It is the caller's responsibility to Commit or Rollback the transaction after
 // this function is called.
-func (c *Client) EnqueueInTx(j *Job, tx *pgx.Tx) error {
+func (c *Client) EnqueueInTx(j *Job, tx pgx.Tx) error {
 	return execEnqueue(j, tx)
 }
 
@@ -188,14 +203,14 @@ func execEnqueue(j *Job, q queryable) error {
 		args.Status = pgtype.Present
 	}
 
-	_, err := q.Exec("que_insert_job", queue, priority, runAt, j.Type, args)
+	_, err := q.Exec(j.context(), "que_insert_job", queue, priority, runAt, j.Type, args)
 	return err
 }
 
 type queryable interface {
-	Exec(sql string, arguments ...interface{}) (commandTag pgx.CommandTag, err error)
-	Query(sql string, args ...interface{}) (*pgx.Rows, error)
-	QueryRow(sql string, args ...interface{}) *pgx.Row
+	Exec(ctx context.Context, sql string, arguments ...interface{}) (commandTag pgconn.CommandTag, err error)
+	Query(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row
 }
 
 // Maximum number of loop iterations in LockJob before giving up.  This is to
@@ -223,15 +238,18 @@ var ErrAgain = errors.New("maximum number of LockJob attempts reached")
 // After the Job has been worked, you must call either Done() or Error() on it
 // in order to return the database connection to the pool and remove the lock.
 func (c *Client) LockJob(queue string) (*Job, error) {
-	conn, err := c.pool.Acquire()
+
+	var ctx = context.Background()
+
+	conn, err := c.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	j := Job{pool: c.pool, conn: conn}
+	j := Job{pool: c.pool, conn: conn, ctx: ctx}
 
 	for i := 0; i < maxLockJobAttempts; i++ {
-		err = conn.QueryRow("que_lock_job", queue).Scan(
+		err = conn.QueryRow(j.context(), "que_lock_job", queue).Scan(
 			&j.Queue,
 			&j.Priority,
 			&j.RunAt,
@@ -241,7 +259,7 @@ func (c *Client) LockJob(queue string) (*Job, error) {
 			&j.ErrorCount,
 		)
 		if err != nil {
-			c.pool.Release(conn)
+			conn.Release()
 			if err == pgx.ErrNoRows {
 				return nil, nil
 			}
@@ -261,7 +279,7 @@ func (c *Client) LockJob(queue string) (*Job, error) {
 		// I'm not sure how to reliably commit a transaction that deletes
 		// the job in a separate thread between lock_job and check_job.
 		var ok bool
-		err = conn.QueryRow("que_check_job", j.Queue, j.Priority, j.RunAt, j.ID).Scan(&ok)
+		err = conn.QueryRow(j.context(), "que_check_job", j.Queue, j.Priority, j.RunAt, j.ID).Scan(&ok)
 		if err == nil {
 			return &j, nil
 		} else if err == pgx.ErrNoRows {
@@ -271,15 +289,34 @@ func (c *Client) LockJob(queue string) (*Job, error) {
 			// eventually causing the server to run out of locks.
 			//
 			// Also swallow the possible error, exactly like in Done.
-			_ = conn.QueryRow("que_unlock_job", j.ID).Scan(&ok)
+			_ = conn.QueryRow(j.context(), "que_unlock_job", j.ID).Scan(&ok)
 			continue
 		} else {
-			c.pool.Release(conn)
+			conn.Release()
 			return nil, err
 		}
 	}
-	c.pool.Release(conn)
+	conn.Release()
 	return nil, ErrAgain
+}
+
+// Preparer defines the interface for types that support preparing
+// statements. This includes all of *pgx.ConnPool, *pgx.Conn, and *pgx.Tx
+type Preparer interface {
+	Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error)
+}
+
+// PrepareStatementsWithPreparer prepares the required statements to run que on
+// the provided Preparer. This func can be used to prepare statements on a
+// *pgx.ConnPool after it is created, or on a *pg.Tx. Every connection used by
+// que must have the statements prepared ahead of time.
+func PrepareStatementsWithPreparer(ctx context.Context, p Preparer) error {
+	for name, sql := range preparedStatements {
+		if _, err := p.Prepare(ctx, name, sql); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 var preparedStatements = map[string]string{
@@ -295,25 +332,6 @@ var preparedStatements = map[string]string{
 // *pgx.Conn. Typically it is used as an AfterConnect func for a
 // *pgx.ConnPool. Every connection used by que must have the statements prepared
 // ahead of time.
-func PrepareStatements(conn *pgx.Conn) error {
-	return PrepareStatementsWithPreparer(conn)
-}
-
-// Preparer defines the interface for types that support preparing
-// statements. This includes all of *pgx.ConnPool, *pgx.Conn, and *pgx.Tx
-type Preparer interface {
-	Prepare(name, sql string) (*pgx.PreparedStatement, error)
-}
-
-// PrepareStatementsWithPreparer prepares the required statements to run que on
-// the provided Preparer. This func can be used to prepare statements on a
-// *pgx.ConnPool after it is created, or on a *pg.Tx. Every connection used by
-// que must have the statements prepared ahead of time.
-func PrepareStatementsWithPreparer(p Preparer) error {
-	for name, sql := range preparedStatements {
-		if _, err := p.Prepare(name, sql); err != nil {
-			return err
-		}
-	}
-	return nil
+func PrepareStatements(ctx context.Context, conn *pgx.Conn) error {
+	return PrepareStatementsWithPreparer(ctx, conn)
 }

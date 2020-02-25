@@ -1,5 +1,13 @@
 # que-go
 
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Original project has not been updated for many years. During this period "ruby-que"" graduated to a different model (schema v4) and "pgx" driver matured to v4.
+This fork (at commit b198c7caf054cfc10e9da6b34f33364d80464425) for now leaves ruby schema v3 compatibility but incorporates changes necessary to use latest pgx branch. It also
+includes original PR#20 (Stop worker when Shutdown() is called, even when jobs are available).
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 [![GoDoc](https://godoc.org/github.com/bgentry/que-go?status.svg)][godoc]
 
 Que-go is a fully interoperable Golang port of [Chris Hanks][chanks]' [Ruby Que
