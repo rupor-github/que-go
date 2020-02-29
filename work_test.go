@@ -60,7 +60,7 @@ func TestLockJob(t *testing.T) {
 	// check for advisory lock
 	var count int64
 	query := "SELECT count(*) FROM pg_locks WHERE locktype=$1 AND objid=$2::bigint"
-	if err = j.pool.QueryRow(j.context(), query, "advisory", j.ID).Scan(&count); err != nil {
+	if err = j.pool.QueryRow(c.ctx, query, "advisory", j.ID).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
@@ -436,7 +436,7 @@ func TestJobDone(t *testing.T) {
 	// make sure lock was released
 	var count int64
 	query := "SELECT count(*) FROM pg_locks WHERE locktype=$1 AND objid=$2::bigint"
-	if err = c.pool.QueryRow(j.context(), query, "advisory", j.ID).Scan(&count); err != nil {
+	if err = c.pool.QueryRow(c.ctx, query, "advisory", j.ID).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
@@ -495,7 +495,7 @@ func TestJobDeleteFromTx(t *testing.T) {
 	}
 
 	// start a transaction
-	tx, err := conn.Begin(j.context())
+	tx, err := conn.Begin(c.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +505,7 @@ func TestJobDeleteFromTx(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = tx.Commit(j.context()); err != nil {
+	if err = tx.Commit(c.ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -546,7 +546,7 @@ func TestJobDeleteFromTxRollback(t *testing.T) {
 	}
 
 	// start a transaction
-	tx, err := conn.Begin(j1.context())
+	tx, err := conn.Begin(c.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,7 +556,7 @@ func TestJobDeleteFromTxRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = tx.Rollback(j1.context()); err != nil {
+	if err = tx.Rollback(c.ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -617,7 +617,7 @@ func TestJobError(t *testing.T) {
 	// make sure lock was released
 	var count int64
 	query := "SELECT count(*) FROM pg_locks WHERE locktype=$1 AND objid=$2::bigint"
-	if err = c.pool.QueryRow(j.context(), query, "advisory", j.ID).Scan(&count); err != nil {
+	if err = c.pool.QueryRow(c.ctx, query, "advisory", j.ID).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {

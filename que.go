@@ -49,17 +49,18 @@ type Job struct {
 	deleted bool
 	pool    *pgxpool.Pool
 	conn    *pgxpool.Conn
-	ctx     context.Context
+
+	// when LockJob reads Job from database this field is copied from Client, so in all relevant cases it would not be nil.
+	ctx context.Context
 }
 
-// context returns context suitable for pgx operations. It will never return nil.
-// NOTE: if callers decides to use cancelable (or deadlined) context for db operations we may need
-// to provide methods to get/set this job's field under mutex protection as it is up to caller to
-// decide what to do with it. It is not yet clear if we need this at all, so this is just a provision for now.
-func (j *Job) context() context.Context {
+// Ctx returns context suitable for pgx operations. It will never return nil.
+// NOTE: during LockJob this field is copied from Client ctx for convinience.
+func (j *Job) Ctx() context.Context {
 	if j.ctx != nil {
 		return j.ctx
 	}
+	// This should never happen during normal operations
 	return context.Background()
 }
 
@@ -87,7 +88,7 @@ func (j *Job) Delete() error {
 		return nil
 	}
 
-	_, err := j.conn.Exec(j.context(), "que_destroy_job", j.Queue, j.Priority, j.RunAt, j.ID)
+	_, err := j.conn.Exec(j.ctx, "que_destroy_job", j.Queue, j.Priority, j.RunAt, j.ID)
 	if err != nil {
 		return err
 	}
@@ -110,7 +111,7 @@ func (j *Job) Done() {
 	var ok bool
 	// Swallow this error because we don't want an unlock failure to cause work to
 	// stop.
-	_ = j.conn.QueryRow(j.context(), "que_unlock_job", j.ID).Scan(&ok)
+	_ = j.conn.QueryRow(j.ctx, "que_unlock_job", j.ID).Scan(&ok)
 
 	j.conn.Release()
 	j.pool = nil
@@ -127,7 +128,7 @@ func (j *Job) Error(msg string) error {
 	errorCount := j.ErrorCount + 1
 	delay := intPow(int(errorCount), 4) + 3 // TODO: configurable delay
 
-	_, err := j.conn.Exec(j.context(), "que_set_error", errorCount, delay, msg, j.Queue, j.Priority, j.RunAt, j.ID)
+	_, err := j.conn.Exec(j.ctx, "que_set_error", errorCount, delay, msg, j.Queue, j.Priority, j.RunAt, j.ID)
 	if err != nil {
 		return err
 	}
@@ -138,13 +139,19 @@ func (j *Job) Error(msg string) error {
 // the queue.
 type Client struct {
 	pool *pgxpool.Pool
+	ctx  context.Context
 
 	// TODO: add a way to specify default queueing options
 }
 
 // NewClient creates a new Client that uses the pgx pool.
 func NewClient(pool *pgxpool.Pool) *Client {
-	return &Client{pool: pool}
+	return &Client{ctx: context.Background(), pool: pool}
+}
+
+// NewClientWithContext creates a new Client that uses the pgx pool and specified context for databse operations.
+func NewClientWithContext(ctx context.Context, pool *pgxpool.Pool) *Client {
+	return &Client{ctx: ctx, pool: pool}
 }
 
 // ErrMissingType is returned when you attempt to enqueue a job with no Type
@@ -153,7 +160,7 @@ var ErrMissingType = errors.New("job type must be specified")
 
 // Enqueue adds a job to the queue.
 func (c *Client) Enqueue(j *Job) error {
-	return execEnqueue(j, c.pool)
+	return execEnqueue(c.ctx, j, c.pool)
 }
 
 // EnqueueInTx adds a job to the queue within the scope of the transaction tx.
@@ -163,10 +170,10 @@ func (c *Client) Enqueue(j *Job) error {
 // It is the caller's responsibility to Commit or Rollback the transaction after
 // this function is called.
 func (c *Client) EnqueueInTx(j *Job, tx pgx.Tx) error {
-	return execEnqueue(j, tx)
+	return execEnqueue(c.ctx, j, tx)
 }
 
-func execEnqueue(j *Job, q queryable) error {
+func execEnqueue(ctx context.Context, j *Job, q queryable) error {
 	if j.Type == "" {
 		return ErrMissingType
 	}
@@ -203,7 +210,7 @@ func execEnqueue(j *Job, q queryable) error {
 		args.Status = pgtype.Present
 	}
 
-	_, err := q.Exec(j.context(), "que_insert_job", queue, priority, runAt, j.Type, args)
+	_, err := q.Exec(ctx, "que_insert_job", queue, priority, runAt, j.Type, args)
 	return err
 }
 
@@ -239,17 +246,15 @@ var ErrAgain = errors.New("maximum number of LockJob attempts reached")
 // in order to return the database connection to the pool and remove the lock.
 func (c *Client) LockJob(queue string) (*Job, error) {
 
-	var ctx = context.Background()
-
-	conn, err := c.pool.Acquire(ctx)
+	conn, err := c.pool.Acquire(c.ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	j := Job{pool: c.pool, conn: conn, ctx: ctx}
+	j := Job{pool: c.pool, conn: conn, ctx: c.ctx}
 
 	for i := 0; i < maxLockJobAttempts; i++ {
-		err = conn.QueryRow(j.context(), "que_lock_job", queue).Scan(
+		err = conn.QueryRow(c.ctx, "que_lock_job", queue).Scan(
 			&j.Queue,
 			&j.Priority,
 			&j.RunAt,
@@ -279,7 +284,7 @@ func (c *Client) LockJob(queue string) (*Job, error) {
 		// I'm not sure how to reliably commit a transaction that deletes
 		// the job in a separate thread between lock_job and check_job.
 		var ok bool
-		err = conn.QueryRow(j.context(), "que_check_job", j.Queue, j.Priority, j.RunAt, j.ID).Scan(&ok)
+		err = conn.QueryRow(c.ctx, "que_check_job", j.Queue, j.Priority, j.RunAt, j.ID).Scan(&ok)
 		if err == nil {
 			return &j, nil
 		} else if err == pgx.ErrNoRows {
@@ -289,7 +294,7 @@ func (c *Client) LockJob(queue string) (*Job, error) {
 			// eventually causing the server to run out of locks.
 			//
 			// Also swallow the possible error, exactly like in Done.
-			_ = conn.QueryRow(j.context(), "que_unlock_job", j.ID).Scan(&ok)
+			_ = conn.QueryRow(c.ctx, "que_unlock_job", j.ID).Scan(&ok)
 			continue
 		} else {
 			conn.Release()
